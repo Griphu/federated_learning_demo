@@ -6,7 +6,5 @@ services:
     build:
       context: ../
       dockerfile: .docker/Dockerfile
-    environment:
-      - DATA_SOURCE=data/load
     ports:
       - "8880:80"
