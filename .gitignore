@@ -129,3 +129,6 @@ dmypy.json
 
 
 notebooks/dataset
+data
+notebooks/models
+notebooks/runs
