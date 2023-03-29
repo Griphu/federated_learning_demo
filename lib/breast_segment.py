@@ -1,29 +1,7 @@
 import numpy as np
-from skimage.exposure import equalize_hist
-from skimage.filters.rank import median
-from skimage.measure import regionprops
-from skimage.morphology import disk
-from skimage.segmentation import felzenszwalb
-from skimage.transform import rescale
-from scipy.ndimage import binary_fill_holes
-from cv2 import resize
+import cv2
 
-
-def breast_segment(im, scale_factor=0.25, threshold=3900, felzenzwalb_scale=0.15):
-    """
-    Fully automated breast segmentation in mammographies.
-    https://github.com/olieidel/breast_segment
-
-    :param im: Image
-    :param scale_factor: Scale Factor
-    :param threshold: Threshold
-    :param felzenzwalb_scale: Felzenzwalb Scale
-
-    :return: (im_mask, bbox) where im_mask is the segmentation mask and
-    bbox is the bounding box (rectangular) of the segmentation.
-
-    """
-
+def determine_side(im, threshold):
     # set threshold to remove artifacts around edges
     im_thres = im.copy()
     im_thres[im_thres > threshold] = 0
@@ -37,95 +15,117 @@ def breast_segment(im, scale_factor=0.25, threshold=3900, felzenzwalb_scale=0.15
         breast_side = 'l'
     else:
         breast_side = 'r'
+    return breast_side
 
-    # rescale and filter aggressively, normalize
-    im_small = rescale(im_thres, scale_factor)
-    im_small_filt = median(im_small, disk(50))
-    # this might not be helping, actually sometimes it is
-    im_small_filt = equalize_hist(im_small_filt)
+def segment_breast(image, threshold = 25):
+    # remove totally white pixels - artifacts
+    img = image.copy()
+    img[img==1] = 0
 
-    # run mr. felzenzwalb
-    segments = felzenszwalb(im_small_filt, scale=felzenzwalb_scale)
-    segments += 1  # otherwise, labels() would ignore segment with segment=0
+    breast_side = determine_side(img, threshold)
+    gray = (img*255).astype(np.uint8)
 
+    # threshold and invert
+    thresh1 = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)[1]
+    thresh1 = 255 - thresh1
 
-    props = regionprops(segments)
-
-    # Sort Props by area, descending
-    props_sorted = sorted(props, key=lambda x: x.area, reverse=True)
-
-    expected_bg_index = 0
-    bg_index = expected_bg_index
-
-    bg_region = props_sorted[bg_index]
-    minr, minc, maxr, maxc = bg_region.bbox
-    filled_mask = bg_region.filled_image
-
-    im_small_fill = np.zeros((im_small_filt.shape[0]+2, im_small_filt.shape[1]+1), dtype=int)
-
+    # remove borders
+    # count number of white pixels in columns as new 1D array
+    count_cols = np.count_nonzero(thresh1, axis=0)
+    # crop image
     if breast_side == 'l':
-        # breast expected to be on left side,
-        # pad on right and bottom side
-        im_small_fill[minr+1:maxr+1, minc:maxc] = filled_mask
-        im_small_fill[0, :] = 1  # top
-        im_small_fill[-1, :] = 1  # bottom
-        im_small_fill[:, -1] = 1  # right
-    elif breast_side == 'r':
-        # breast expected to be on right side,
-        # pad on left and bottom side
-        im_small_fill[minr+1:maxr+1, minc+1:maxc+1] = filled_mask  # shift mask to right side
-        im_small_fill[0, :] = 1  # top
-        im_small_fill[-1, :] = 1  # bottom
-        im_small_fill[:, 0] = 1  # left
-
-    im_small_fill = binary_fill_holes(im_small_fill)
-
-    im_small_mask = im_small_fill[1:-1, :-1] if breast_side == 'l' \
-                  else im_small_fill[1:-1, 1:]
-
-    # rescale mask
-    im_mask = resize(np.array(im_small_mask).astype('float32'), im.shape).astype(int).astype(bool)
-
-    # invert!
-    im_mask = ~im_mask
-
-    # determine side of breast in mask and compare
-    col_sums_split = np.array_split(np.sum(im_mask, axis=0), 2)
-    left_col_sum = np.sum(col_sums_split[0])
-    right_col_sum = np.sum(col_sums_split[1])
-
-    if left_col_sum > right_col_sum:
-        breast_side_mask = 'l'
+        # get first and last x coordinate where black
+        first_x = 0
+        last_x = np.where(count_cols>0)[0][-1]
     else:
-        breast_side_mask = 'r'
+        # get first and last x coordinate where black
+        first_x = np.where(count_cols>0)[0][0]
+        last_x = img.shape[0]-1
 
-    if breast_side_mask != breast_side:
-        # breast mask is not on expected side
-        # we might have segmented bg instead of breast
-        # so invert again
-        print('breast and mask side mismatch. inverting!')
-        im_mask = ~im_mask
+    # count number of white pixels in rows as new 1D array
+    count_rows = np.count_nonzero(thresh1, axis=1)
+        # get first and last y coordinate where black
+    first_y = max(np.where(count_rows>0)[0][0],5)
+    last_y = min(np.where(count_rows>0)[0][-1],img.shape[1]-5)
+    crop = img[first_y:last_y+1, first_x:last_x+1]
 
-    # exclude thresholded area (artifacts) in mask, too
-    im_mask[im > threshold] = False
+    # crop thresh1 and invert
+    thresh2 = thresh1[first_y:last_y+1, first_x:last_x+1]
+    thresh2 = 255 - thresh2
 
-    # fill holes again, just in case there was a high-intensity region
-    # in the breast
-    im_mask = binary_fill_holes(im_mask)
+    # get external contours and keep largest one
+    contours = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = contours[0] if len(contours) == 2 else contours[1]
+    big_contour = max(contours, key=cv2.contourArea)
 
-    # if no region found, abort early and return mask of complete image
-    if im_mask.ravel().sum() == 0:
-        all_mask = np.ones_like(im).astype(bool)
-        bbox = (0, 0, im.shape[0], im.shape[1])
-        print('Couldn\'t find any segment')
-        return all_mask, bbox
+    # make mask from contour
+    mask = np.zeros_like(thresh2 , dtype=np.uint8)
+    drawcont = cv2.drawContours(mask, [big_contour], 0, 255, -1)
 
-    # get bbox
-    minr = np.argwhere(im_mask.any(axis=1)).ravel()[0]
-    maxr = np.argwhere(im_mask.any(axis=1)).ravel()[-1]
-    minc = np.argwhere(im_mask.any(axis=0)).ravel()[0]
-    maxc = np.argwhere(im_mask.any(axis=0)).ravel()[-1]
+    # make crop black everywhere except where largest contour is white in mask
+    result = crop.copy()# img.copy() 
+    result[mask==0] = 0
+    # reshape to 244,244
+    if img.shape[1] != result.shape[1]:
+        result = np.c_[result,np.zeros((result.shape[0],(img.shape[1] - result.shape[1])))]
+    if img.shape[0] != result.shape[0]:
+        result = np.append(result, np.zeros(((img.shape[0] - result.shape[0]),result.shape[1])), axis=0)
 
-    bbox = (minr, minc, maxr, maxc)
+    return result
 
-    return im_mask, bbox
+
+def segment_breast_16b(image, threshold = 25, refactor = 257):
+    # remove totally white pixels - artifacts
+    img = image.copy()
+    img[img==img.max()] = 0
+
+    breast_side = determine_side(img, threshold)
+    gray = img.copy()
+
+    # threshold and invert
+    thresh1 = cv2.threshold(gray, threshold, gray.max(), cv2.THRESH_BINARY)[1]
+    thresh1 = gray.max() - thresh1
+
+    # remove borders
+    # count number of white pixels in columns as new 1D array
+    count_cols = np.count_nonzero(thresh1, axis=0)
+    # crop image
+    if breast_side == 'l':
+        # get first and last x coordinate where black
+        first_x = 0
+        last_x = np.where(count_cols>0)[0][-1]
+    else:
+        # get first and last x coordinate where black
+        first_x = np.where(count_cols>0)[0][0]
+        last_x = img.shape[0]-1
+
+    # count number of white pixels in rows as new 1D array
+    count_rows = np.count_nonzero(thresh1, axis=1)
+        # get first and last y coordinate where black
+    first_y = max(np.where(count_rows>0)[0][0],5)
+    last_y = min(np.where(count_rows>0)[0][-1],img.shape[1]-5)
+    crop = img[first_y:last_y+1, first_x:last_x+1]
+
+    # crop thresh1 and invert
+    thresh2 = thresh1[first_y:last_y+1, first_x:last_x+1]
+    thresh2 = gray.max() - thresh2
+
+    # get external contours and keep largest one
+    contours = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = contours[0] if len(contours) == 2 else contours[1]
+    big_contour = max(contours, key=cv2.contourArea)
+
+    # make mask from contour
+    mask = np.zeros_like(thresh2 , dtype=np.uint16)
+    drawcont = cv2.drawContours(mask, [big_contour], 0, gray.max(), -1)
+
+    # make crop black everywhere except where largest contour is white in mask
+    result = crop.copy()# img.copy() 
+    result[mask==0] = 0
+    # reshape to 244,244
+    if img.shape[1] != result.shape[1]:
+        result = np.c_[result,np.zeros((result.shape[0],(img.shape[1] - result.shape[1])))]
+    if img.shape[0] != result.shape[0]:
+        result = np.append(result, np.zeros(((img.shape[0] - result.shape[0]),result.shape[1])), axis=0)
+
+    return result

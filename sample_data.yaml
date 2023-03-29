@@ -1,0 +1,9 @@
+train: sample_data/images/train/ 
+val:  sample_data/images/validation/
+test: sample_data/images/validation/
+
+# number of classes
+nc: 2
+
+# class names
+names: ["fura","oczko"]
